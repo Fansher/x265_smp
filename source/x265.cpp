@@ -152,7 +152,7 @@ static uint8_t getNumAbrEncodes(FILE* abrConfig)
 static bool parseAbrConfig(FILE* abrConfig, CLIOptions cliopt[], uint8_t numEncodes)
 {
     char line[1024];
-    char* argLine;
+    char* argLine;  
 
     for (uint32_t i = 0; i < numEncodes; i++)
     {
