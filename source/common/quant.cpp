@@ -403,6 +403,7 @@ uint32_t Quant::transformNxN(const CUData& cu, const pixel* fenc, uint32_t fencS
     const uint32_t sizeIdx = log2TrSize - 2;
 
     // 如果直接使用bypass，表示不进行变换和量化，直接将残差数据拷贝到变换系数内存块中
+    // HEVC PPS中存在语法元素transquant_bypass_enable_flag，允许对残差不进行变换、量化及环路滤波
     // coeff：存储变换/量化后的变换系数
     // residual：残差数据（预测数据与原始数据之间的差值）
     if (cu.m_tqBypass[0])

@@ -511,13 +511,23 @@ void Analysis::qprdRefine(const CUData& parentCTU, const CUGeom& cuGeom, int32_t
     md.bestMode->reconYuv.copyToPicYuv(*m_frame->m_reconPic, parentCTU.m_cuAddr, cuGeom.absPartIdx);
 }
 
+/*
+* 帧内编码
+* 计算父CU的率失真代价，也即当前CU划分前的率失真代价
+* 循环遍历子CU，递归调用自身获取划分后的率失真代价
+* 比较率失真代价，更新best mode
+*/
 uint64_t Analysis::compressIntraCU(const CUData& parentCTU, const CUGeom& cuGeom, int32_t qp)
 {
+    // 当前CU的深度，0~3,0表示64x64大小，3表示8x8大小
     uint32_t depth = cuGeom.depth;
+    // 当前CU对应深度的模式信息，一个CTU会有不同深度下的模式信息，每个深度的模式信息分别保存在m_modeDepth[depth]中
     ModeDepth& md = m_modeDepth[depth];
     md.bestMode = NULL;
 
+    // 当前CU可能还会继续划分（如果不是叶子节点，是可能继续划分的）
     bool mightSplit = !(cuGeom.flags & CUGeom::LEAF);
+    // 当前CU可能不会划分（如果没有强制需要划分，是可以不用划分的）
     bool mightNotSplit = !(cuGeom.flags & CUGeom::SPLIT_MANDATORY);
 
     bool bAlreadyDecided = m_param->intraRefine != 4 && parentCTU.m_lumaIntraDir[cuGeom.absPartIdx] != (uint8_t)ALL_IDX && !(m_param->bAnalysisType == HEVC_INFO);
@@ -531,8 +541,10 @@ uint64_t Analysis::compressIntraCU(const CUData& parentCTU, const CUGeom& cuGeom
             bAlreadyDecided = false;
     }
 
+    /*** 计算划分前的代价（mightNotSplit标记当前CU不划分）***/
     if (bAlreadyDecided)
     {
+        // 当存在可用模式集合时
         if (bDecidedDepth && mightNotSplit)
         {
             Mode& mode = md.pred[0];
@@ -556,10 +568,12 @@ uint64_t Analysis::compressIntraCU(const CUData& parentCTU, const CUGeom& cuGeom
     }
     else if (cuGeom.log2CUSize != MAX_LOG2_CU_SIZE && mightNotSplit)
     {
+        // 当不存在可用的模式集合时
         md.pred[PRED_INTRA].cu.initSubCU(parentCTU, cuGeom, qp);
         checkIntra(md.pred[PRED_INTRA], cuGeom, SIZE_2Nx2N);
         checkBestMode(md.pred[PRED_INTRA], depth);
 
+        // 8x8CU不能继续划分为更小的CU，针对4x4PU帧内划分模式PRED_INTRA_NxN进行搜索
         if (cuGeom.log2CUSize == 3 && m_slice->m_sps->quadtreeTULog2MinSize < 3)
         {
             md.pred[PRED_INTRA_NxN].cu.initSubCU(parentCTU, cuGeom, qp);
@@ -573,6 +587,7 @@ uint64_t Analysis::compressIntraCU(const CUData& parentCTU, const CUGeom& cuGeom
         if (mightSplit)
             addSplitFlagCost(*md.bestMode, cuGeom.depth);
     }
+    /*** 结束计算划分前的代价 ***/
 
     // stop recursion if we reach the depth of previous analysis decision
     mightSplit &= !(bAlreadyDecided && bDecidedDepth) || split;

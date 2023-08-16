@@ -302,24 +302,38 @@ void Search::codeCoeffQTChroma(const CUData& cu, uint32_t tuDepth, uint32_t absP
     }
 }
 
+/*** 
+ * 计算帧内预测（亮度分量）下的RDCost
+ * 根据传参进来的预测模式进行预测，然后进行变换、量化、反变换、反量化、重建，计算RDCost 
+ * 完整编码得到严格意义上的bits开销和distortion（sse）开销
+ ***/
 void Search::codeIntraLumaQT(Mode& mode, const CUGeom& cuGeom, uint32_t tuDepth, uint32_t absPartIdx, bool bAllowSplit, Cost& outCost, const uint32_t depthRange[2])
 {
     CUData& cu = mode.cu;
+    // 当前TU在整个CTU中的深度（CUDepth + TUDepth）
     uint32_t fullDepth  = cuGeom.depth + tuDepth;
+    // 当前TU对应的logSIZE
     uint32_t log2TrSize = cuGeom.log2CUSize - tuDepth;
     uint32_t qtLayer    = log2TrSize - 2;
     uint32_t sizeIdx    = log2TrSize - 2;
+    // 初步判断当前TU是否可以继续划分
+    // depthRange[0,1]表示允许的TU深度范围
     bool mightNotSplit  = log2TrSize <= depthRange[1];
     bool mightSplit     = (log2TrSize > depthRange[0]) && (bAllowSplit || !mightNotSplit);
     bool bEnableRDOQ  = !!m_param->rdoqLevel;
 
     /* If maximum RD penalty, force spits at TU size 32x32 if SPS allows TUs of 16x16 */
+    // 强制对TU进行划分的情形：
+    // rdPenalty为2，表示full penalty
+    // 当前slice为非I slice，一般对应的就是P slice和B slice
+    // 当前TU的尺寸为32x32（log2TrSize == 5），并且允许TU的尺寸小于等于16x16（depthRange[0] <= 4）
     if (m_param->rdPenalty == 2 && m_slice->m_sliceType != I_SLICE && log2TrSize == 5 && depthRange[0] <= 4)
     {
         mightNotSplit = false;
         mightSplit = true;
     }
 
+    // fullCost表示当前CU不进行TU划分；与之对应的splitCost表示对CU进行TU划分
     Cost fullCost;
     uint32_t bCBF = 0;
 
@@ -339,10 +353,13 @@ void Search::codeIntraLumaQT(Mode& mode, const CUGeom& cuGeom, uint32_t tuDepth,
         // init availability pattern
         uint32_t lumaPredMode = cu.m_lumaIntraDir[absPartIdx];
         IntraNeighbors intraNeighbors;
+        // 得到相邻PU的可参考信息
         initIntraNeighbors(cu, absPartIdx, tuDepth, true, &intraNeighbors);
+        // 进行相邻像素补全及平滑滤波（帧内预测参考的是原始像素滤波后的像素值）
         initAdiPattern(cu, cuGeom, absPartIdx, intraNeighbors, lumaPredMode);
 
         // get prediction signal
+        // 按照帧内预测方向进行帧内预测，pred保存的是预测YUV
         predIntraLumaAng(lumaPredMode, pred, stride, log2TrSize);
 
         cu.setTransformSkipSubParts(0, TEXT_LUMA, absPartIdx, fullDepth);
@@ -354,9 +371,14 @@ void Search::codeIntraLumaQT(Mode& mode, const CUGeom& cuGeom, uint32_t tuDepth,
         // store original entropy coding status
         if (bEnableRDOQ)
             m_entropyCoder.estBit(m_entropyCoder.m_estBitsSbac, log2TrSize, true);
+        // 计算残差residual = fenc - pred
         primitives.cu[sizeIdx].calcresidual[stride % 64 == 0](fenc, pred, residual, stride);
-
+        // 对残差数据进行变换量化后，变换系数保存在coeffY中
         uint32_t numSig = m_quant.transformNxN(cu, fenc, stride, residual, stride, coeffY, log2TrSize, TEXT_LUMA, absPartIdx, false);
+        
+        // 计算重构像素YUV：reconQt
+        // 如果变换系数非全零，则进行反变换量化后计算reconQt
+        // 如果变换系数全为0，则reconQt等于pred
         if (numSig)
         {
             m_quant.invtransformNxN(cu, residual, stride, coeffY, log2TrSize, TEXT_LUMA, true, false, numSig);
@@ -372,6 +394,7 @@ void Search::codeIntraLumaQT(Mode& mode, const CUGeom& cuGeom, uint32_t tuDepth,
 
         bCBF = !!numSig << tuDepth;
         cu.setCbfSubParts(bCBF, TEXT_LUMA, absPartIdx, fullDepth);
+        // 根据fenc和reconQt计算sse失真（distortion）
         fullCost.distortion = primitives.cu[sizeIdx].sse_pp(reconQt, reconQtStride, fenc, stride);
 
         m_entropyCoder.resetBits();
@@ -387,6 +410,9 @@ void Search::codeIntraLumaQT(Mode& mode, const CUGeom& cuGeom, uint32_t tuDepth,
 
             m_entropyCoder.codePartSize(cu, 0, cuGeom.depth);
         }
+        // 编码帧内预测方向
+        // 若当前是SIZE_2Nx2N，则只需编码1个预测方向
+        // 否则，划分为了4个子块，需编码4个预测方向
         if (cu.m_partSize[0] == SIZE_2Nx2N)
         {
             if (!absPartIdx)
@@ -406,16 +432,23 @@ void Search::codeIntraLumaQT(Mode& mode, const CUGeom& cuGeom, uint32_t tuDepth,
         if (log2TrSize != depthRange[0])
             m_entropyCoder.codeTransformSubdivFlag(0, 5 - log2TrSize);
 
+        // 编码cbf（系数全零标志，如果系数全零表示没有残差，否则有残差）
         m_entropyCoder.codeQtCbfLuma(!!numSig, tuDepth);
 
+        // 如果存在cbf，表示量化系数非全零（也即有残差），则编码残差
         if (cu.getCbf(absPartIdx, TEXT_LUMA, tuDepth))
             m_entropyCoder.codeCoeffNxN(cu, coeffY, absPartIdx, log2TrSize, TEXT_LUMA);
 
+        // 得到上面编码的bits开销综合
         fullCost.bits = m_entropyCoder.getNumberOfWrittenBits();
 
+        // 对于非I帧（也即P帧和B帧）内的32x32大小的TU，若开启了rdPenalty，则bits开销要翻至4倍
+        // 这样做的目的是有利于帧间编码
         if (m_param->rdPenalty && log2TrSize == 5 && m_slice->m_sliceType != I_SLICE)
             fullCost.bits *= 4;
-
+        // 至此，编码bits开销也计算完毕
+        
+        // 根据已经计算好的distortion和bits来计算RDCost和energy
         if (m_rdCost.m_psyRd)
         {
             fullCost.energy = m_rdCost.psyCost(sizeIdx, fenc, mode.fencYuv->m_size, reconQt, reconQtStride);
@@ -432,6 +465,7 @@ void Search::codeIntraLumaQT(Mode& mode, const CUGeom& cuGeom, uint32_t tuDepth,
     else
         fullCost.rdcost = MAX_INT64;
 
+    // 如果可以split，则计算splitCost（与fullCost对应）
     if (mightSplit)
     {
         if (mightNotSplit)
@@ -443,12 +477,14 @@ void Search::codeIntraLumaQT(Mode& mode, const CUGeom& cuGeom, uint32_t tuDepth,
         /* code split block */
         uint32_t qNumParts = 1 << (log2TrSize - 1 - LOG2_UNIT_SIZE) * 2;
 
+        // 是否跳过transform（HEVC中存在语法元素transform_skip_enable_flag允许直接对预测残差进行量化、熵编码而不进行变换）
         int checkTransformSkip = m_slice->m_pps->bTransformSkipEnabled && (log2TrSize - 1) <= MAX_LOG2_TS_SIZE && !cu.m_tqBypass[0];
         if (m_param->bEnableTSkipFast)
             checkTransformSkip &= cu.m_partSize[0] != SIZE_2Nx2N;
 
         Cost splitCost;
         uint32_t cbf = 0;
+        // 如果当前TU是需要继续划分的，则子TU递归调用本函数进行残差编码
         for (uint32_t qIdx = 0, qPartIdx = absPartIdx; qIdx < 4; ++qIdx, qPartIdx += qNumParts)
         {
             if (checkTransformSkip)
@@ -475,6 +511,7 @@ void Search::codeIntraLumaQT(Mode& mode, const CUGeom& cuGeom, uint32_t tuDepth,
                 splitCost.rdcost = m_rdCost.calcRdCost(splitCost.distortion, splitCost.bits);
         }
 
+        // 择优选择划分和不划分情况下的cost
         if (splitCost.rdcost < fullCost.rdcost)
         {
             outCost.rdcost     += splitCost.rdcost;
@@ -495,6 +532,7 @@ void Search::codeIntraLumaQT(Mode& mode, const CUGeom& cuGeom, uint32_t tuDepth,
         }
     }
 
+    // 不划分情况下是最优解（实际上划分是最优解也走不到这），则恢复recon的YUV数据并保存
     // set reconstruction for next intra prediction blocks if full TU prediction won
     PicYuv*  reconPic = m_frame->m_reconPic;
     pixel*   picReconY = reconPic->getLumaAddr(cu.m_cuAddr, cuGeom.absPartIdx + absPartIdx);
@@ -1233,6 +1271,7 @@ void Search::residualQTIntraChroma(Mode& mode, const CUGeom& cuGeom, uint32_t ab
     }
 }
 
+/*** 计算当前CU的亮度最优预测模式和色度最优预测模式，以及对应的RD cost ***/
 void Search::checkIntra(Mode& intraMode, const CUGeom& cuGeom, PartSize partSize)
 {
     CUData& cu = intraMode.cu;
@@ -1244,7 +1283,9 @@ void Search::checkIntra(Mode& intraMode, const CUGeom& cuGeom, PartSize partSize
     cu.getIntraTUQtDepthRange(tuDepthRange, 0);
 
     intraMode.initCosts();
+    // 亮度预测的失真（选择最适合的帧内预测角度，色度分量也是）
     intraMode.lumaDistortion += estIntraPredQT(intraMode, cuGeom, tuDepthRange);
+    // 色度预测的失真（只有非I400格式才有色度分量数据）
     if (m_csp != X265_CSP_I400)
     {
         intraMode.chromaDistortion += estIntraPredChromaQT(intraMode, cuGeom);
@@ -1272,7 +1313,9 @@ void Search::checkIntra(Mode& intraMode, const CUGeom& cuGeom, PartSize partSize
     bool bCodeDQP = m_slice->m_pps->bUseDQP;
     m_entropyCoder.codeCoeff(cu, 0, bCodeDQP, tuDepthRange);
     m_entropyCoder.store(intraMode.contexts);
+    // 帧内模式的总bits
     intraMode.totalBits = m_entropyCoder.getNumberOfWrittenBits();
+    // 帧内模式下变换系数的总bits
     intraMode.coeffBits = intraMode.totalBits - intraMode.mvBits - skipFlagBits;
     const Yuv* fencYuv = intraMode.fencYuv;
     if (m_rdCost.m_psyRd)
@@ -1506,6 +1549,7 @@ void Search::encodeIntraInInter(Mode& intraMode, const CUGeom& cuGeom)
     checkDQP(intraMode, cuGeom);
 }
 
+/*** 帧内亮度预测模式选择 ***/
 sse_t Search::estIntraPredQT(Mode &intraMode, const CUGeom& cuGeom, const uint32_t depthRange[2])
 {
     CUData& cu = intraMode.cu;
@@ -1515,6 +1559,7 @@ sse_t Search::estIntraPredQT(Mode &intraMode, const CUGeom& cuGeom, const uint32
 
     uint32_t depth        = cuGeom.depth;
     uint32_t initTuDepth  = cu.m_partSize[0] != SIZE_2Nx2N;
+    // 当前CU对应的PU的个数（1或者4）
     uint32_t numPU        = 1 << (2 * initTuDepth);
     uint32_t log2TrSize   = cuGeom.log2CUSize - initTuDepth;
     uint32_t tuSize       = 1 << log2TrSize;
@@ -1526,6 +1571,7 @@ sse_t Search::estIntraPredQT(Mode &intraMode, const CUGeom& cuGeom, const uint32
     int checkTransformSkip = m_slice->m_pps->bTransformSkipEnabled && !cu.m_tqBypass[0] && cu.m_partSize[0] != SIZE_2Nx2N;
 
     // loop over partitions
+    // 在当前CU下遍历每一个PU
     for (uint32_t puIdx = 0; puIdx < numPU; puIdx++, absPartIdx += qNumParts)
     {
         uint32_t bmode = 0;
@@ -1537,12 +1583,19 @@ sse_t Search::estIntraPredQT(Mode &intraMode, const CUGeom& cuGeom, const uint32
             uint64_t candCostList[MAX_RD_INTRA_MODES];
             uint32_t rdModeList[MAX_RD_INTRA_MODES];
             uint64_t bcost;
+            // 候选模式个数与rdLevel、CU深度、TU深度有关
             int maxCandCount = 2 + m_param->rdLevel + ((depth + initTuDepth) >> 1);
 
+            /*
+            ** 粗选：选出最佳的maxCandCount个候选模式
+            ** 遍历35种预测模式，以预测像素和原始像素的差值的SAD作为失真D，编码预测模式比特作为R，计算SAD cost，选出最佳的maxCandCount种模式
+            ** 然后根据代价阈值选择最终的模式存放在rdModeList[]
+            */
             {
                 ProfileCUScope(intraMode.cu, intraAnalysisElapsedTime, countIntraAnalysis);
 
                 // Reference sample smoothing
+                // 帧内预测参考的是经滤波的相邻像素（不是原始像素！！！）
                 IntraNeighbors intraNeighbors;
                 initIntraNeighbors(cu, absPartIdx, initTuDepth, true, &intraNeighbors);
                 initAdiPattern(cu, cuGeom, absPartIdx, intraNeighbors, ALL_IDX);
@@ -1568,6 +1621,7 @@ sse_t Search::estIntraPredQT(Mode &intraMode, const CUGeom& cuGeom, const uint32
                 pixelcmp_t sa8d = primitives.cu[sizeIdx].sa8d;
                 uint64_t modeCosts[35];
 
+                // DC预测 + PLANAR预测 + 33种角度预测
                 // DC
                 primitives.cu[sizeIdx].intra_pred[DC_IDX](m_intraPred, scaleStride, intraNeighbourBuf[0], 0, (scaleTuSize <= 16));
                 uint32_t bits = (mpms & ((uint64_t)1 << DC_IDX)) ? m_entropyCoder.bitsIntraModeMPM(mpmModes, DC_IDX) : rbits;
@@ -1586,6 +1640,7 @@ sse_t Search::estIntraPredQT(Mode &intraMode, const CUGeom& cuGeom, const uint32
                 COPY1_IF_LT(bcost, modeCosts[PLANAR_IDX]);
 
                 // angular predictions
+                // 注意：在开启intra_pred_allangs的情况下，有区分水平类预测模式和垂直类预测模式下的SAD计算方式
                 if (primitives.cu[sizeIdx].intra_pred_allangs)
                 {
                     primitives.cu[sizeIdx].transpose(m_fencTransposed, fenc, scaleStride);
@@ -1613,6 +1668,8 @@ sse_t Search::estIntraPredQT(Mode &intraMode, const CUGeom& cuGeom, const uint32
                         COPY1_IF_LT(bcost, modeCosts[mode]);
                     }
                 }
+                // 至此，所有35种模式对应的RDCost保存在modeCosts[]
+                // 而bcost对应的是这35种模式代价的最小值
 
                 /* Find the top maxCandCount candidate modes with cost within 25% of best
                 * or among the most probable modes. maxCandCount is derived from the
@@ -1621,6 +1678,8 @@ sse_t Search::estIntraPredQT(Mode &intraMode, const CUGeom& cuGeom, const uint32
                 for (int i = 0; i < maxCandCount; i++)
                     candCostList[i] = MAX_INT64;
 
+                // 事实上并不是严格选择最小代价的maxCandCount个预测模式，而是通过最小代价的1.25倍设置阈值进行选择
+                // 最终被选择的候选模式放入rdModeList[]，这样做的目的是期望选择更多的预测模式
                 uint64_t paddedBcost = bcost + (bcost >> 2); // 1.25%
                 for (int mode = 0; mode < 35; mode++)
                     if ((modeCosts[mode] < paddedBcost) || ((uint32_t)mode == mpmModes[0])) 
@@ -1629,6 +1688,10 @@ sse_t Search::estIntraPredQT(Mode &intraMode, const CUGeom& cuGeom, const uint32
             }
 
             /* measure best candidates using simple RDO (no TU splits) */
+            /*
+            ** 简单RDO：不进行PU划分，从上述选出的预测模式列表中选择最合适（RDCost最小）的预测模式
+            ** 区别于上面的粗选，此处的RDO会进行变换、量化、反变换以及熵编码，但变换时禁止进行TU划分
+            */
             bcost = MAX_INT64;
             for (int i = 0; i < maxCandCount; i++)
             {
@@ -1647,11 +1710,17 @@ sse_t Search::estIntraPredQT(Mode &intraMode, const CUGeom& cuGeom, const uint32
                     codeIntraLumaQT(intraMode, cuGeom, initTuDepth, absPartIdx, false, icosts, depthRange);
                 COPY2_IF_LT(bcost, icosts.rdcost, bmode, rdModeList[i]);
             }
+            // 至此，bcost保存的是简单RDO下的最小值（实际没什么作用，后面也不会用到了）
+            // bmode保存的是简单RDO下对应的最优预测模式
         }
 
         ProfileCUScope(intraMode.cu, intraRDOElapsedTime[cuGeom.depth], countIntraRDO[cuGeom.depth]);
 
         /* remeasure best mode, allowing TU splits */
+        /*
+        ** RDO：此时的RDO只是针对上面选择的最优预测模式进行的，目的是为了计算最终的RDCost
+        ** 因此，此时RDO相对于简单RDO是，允许TU划分
+        */
         cu.setLumaIntraDirSubParts(bmode, absPartIdx, depth + initTuDepth);
         m_entropyCoder.load(m_rqt[depth].cur);
 
@@ -1660,6 +1729,7 @@ sse_t Search::estIntraPredQT(Mode &intraMode, const CUGeom& cuGeom, const uint32
             codeIntraLumaTSkip(intraMode, cuGeom, initTuDepth, absPartIdx, icosts);
         else
             codeIntraLumaQT(intraMode, cuGeom, initTuDepth, absPartIdx, true, icosts, depthRange);
+        // 计算所选预测模式的最优失真
         totalDistortion += icosts.distortion;
 
         extractIntraResultQT(cu, *reconYuv, initTuDepth, absPartIdx);
