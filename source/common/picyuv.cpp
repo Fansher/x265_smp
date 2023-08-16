@@ -72,6 +72,9 @@ PicYuv::PicYuv()
 bool PicYuv::create(x265_param* param, bool picAlloc, pixel *pixelbuf)
 {
     m_param = param;
+    // sourceWidth：原始图片满足条件后的像素宽：如果原始宽不能被4的偶数倍整除（实际就是被8整除），则需要填充像素使之满足
+    // sourceHeight的处理方式同sourceWidth
+    // 注意的是：这个地方填充的像素值是会被正常进行编码的！！！（解码端会根据相关语法进行判断是否显示）
     uint32_t picWidth = m_param->sourceWidth;
     uint32_t picHeight = m_param->sourceHeight;
     uint32_t picCsp = m_param->internalCsp;
@@ -81,36 +84,51 @@ bool PicYuv::create(x265_param* param, bool picAlloc, pixel *pixelbuf)
     m_vChromaShift = CHROMA_V_SHIFT(picCsp);
     m_picCsp = picCsp;
 
+    // 按最大CU大小，计算一行/一列最多有多少个CU
     uint32_t numCuInWidth = (m_picWidth + param->maxCUSize - 1)  / param->maxCUSize;
     uint32_t numCuInHeight = (m_picHeight + param->maxCUSize - 1) / param->maxCUSize;
 
+    // 亮度分量有效像素四周补充像素个数，该过程与原始像素宽高无关（与后续滤波操作有关）：
+    // 水平两侧各补充96个像素(最大CU为64x64的情况下)
+    // 垂直两侧各补充80个像素(最大CU为64x64的情况下)
     m_lumaMarginX = param->maxCUSize + 32; // search margin and 8-tap filter half-length, padded for 32-byte alignment
     m_lumaMarginY = param->maxCUSize + 16; // margin for 8-tap filter and infinite padding
+    // 根据上面的补充判断得到，亮度分量的水平步长就是umCuInWidth * param->maxCUSize，加上左右两侧补充的像素个数（表示一行有这么多空间大小）
     m_stride = (numCuInWidth * param->maxCUSize) + (m_lumaMarginX << 1);
 
     int maxHeight = numCuInHeight * param->maxCUSize;
+    // 亮度分量（Y通道）相关像素内存分配
     if (pixelbuf)
         m_picOrg[0] = pixelbuf;
     else
     {
         if (picAlloc)
         {
+            // m_picBuf[0]：亮度分量（Y通道）包含实际像素（有效像素）和补充像素
+            // m_picOrg[0]：亮度分量（Y通道）实际有效像素的起止位置
             CHECKED_MALLOC(m_picBuf[0], pixel, m_stride * (maxHeight + (m_lumaMarginY * 2)));
             m_picOrg[0] = m_picBuf[0] + m_lumaMarginY * m_stride + m_lumaMarginX;
         }
     }
 
+    // 色度分量（UV通道）相关像素内存分配
     if (picCsp != X265_CSP_I400)
     {
+        // 色度分量有效像素四周补充像素个数：
+        // 水平方向与亮度分量的水平方向一致
+        // 垂直方向与数据格式有关，420格式的相对亮度分量的垂直方向减半
         m_chromaMarginX = m_lumaMarginX;  // keep 16-byte alignment for chroma CTUs
         m_chromaMarginY = m_lumaMarginY >> m_vChromaShift;
+        // 色度分量的水平步长，与亮度分量类似，只是色度分量的有效像素宽是Y通道对应的一半
         m_strideC = ((numCuInWidth * m_param->maxCUSize) >> m_hChromaShift) + (m_chromaMarginX * 2);
         if (picAlloc)
         {
             CHECKED_MALLOC(m_picBuf[1], pixel, m_strideC * ((maxHeight >> m_vChromaShift) + (m_chromaMarginY * 2)));
             CHECKED_MALLOC(m_picBuf[2], pixel, m_strideC * ((maxHeight >> m_vChromaShift) + (m_chromaMarginY * 2)));
 
+            // 色度分量（U通道）有效像素起止位置 
             m_picOrg[1] = m_picBuf[1] + m_chromaMarginY * m_strideC + m_chromaMarginX;
+            // 色度分量（V通道）有效像素起止位置
             m_picOrg[2] = m_picBuf[2] + m_chromaMarginY * m_strideC + m_chromaMarginX;
         }
     }
@@ -206,6 +224,9 @@ void PicYuv::destroy()
 
 /* Copy pixels from an x265_picture into internal PicYuv instance.
  * Shift pixels as necessary, mask off bits above X265_DEPTH for safety. */
+// 将输入YUV数据（x265_picture）保存至编码器内部结构体x265_picyuv中
+// 一定要注意的是：输入数据只包含原始像素数据，不包括任何padding数据和内存块
+// padding只在水平/垂直方向的一侧进行，不需要在两侧填充
 void PicYuv::copyFromPicture(const x265_picture& pic, const x265_param& param, int padx, int pady)
 {
     /* m_picWidth is the width that is being encoded, padx indicates how many
@@ -218,10 +239,14 @@ void PicYuv::copyFromPicture(const x265_picture& pic, const x265_param& param, i
      * The same applies to m_picHeight and pady */
 
     /* width and height - without padsize (input picture raw width and height) */
+    // width和height是实际输入图片的宽高，m_picWidth和m_picHeight是编码器实际要编码的宽高
+    // padx和pady则是达到上述要求时要填充的像素数量
+    // 注：从后面的padding操作可以看出，只是对图像的右方（如果有padx）/下方（如果有pady）进行填充
     int width = m_picWidth - padx;
     int height = m_picHeight - pady;
 
     /* internal pad to multiple of 16x16 blocks */
+    // X265需要保证分辨率是16x16的整数倍，不足16的像素需要再次补齐（padding）
     uint8_t rem = width & 15;
 
     padx = rem ? 16 - rem : padx;
@@ -270,10 +295,12 @@ void PicYuv::copyFromPicture(const x265_picture& pic, const x265_param& param, i
             // TODO: Does we need this path? may merge into above in future
         {
             pixel *yPixel = m_picOrg[0];
+            // pic.planes[0]是输入图片没有经任何padding的像素数据
             uint8_t *yChar = (uint8_t*)pic.planes[0];
 
             for (int r = 0; r < height; r++)
             {
+                // 因此，此处是直接copy的未经任何padding的原始像素数据
                 memcpy(yPixel, yChar, width * sizeof(pixel));
 
                 yPixel += m_stride;
@@ -424,9 +451,15 @@ void PicYuv::copyFromPicture(const x265_picture& pic, const x265_param& param, i
     (void) param;
 #endif
 
+    /*
+    ** 至此，已经将输入图像的原始数据copy到编码器内部相关结构体中
+    ** 那么，编码器内部需要padding的数据，该怎么办？下文解决
+    */
+    
     /* extend the right edge if width was not multiple of the minimum CU size */
     for (int r = 0; r < height; r++)
     {
+        // 在Y通道的每一行尾部进行padding，值全部是该行最后一个像素值大小
         for (int x = 0; x < padx; x++)
             Y[width + x] = Y[width - 1];
         Y += m_stride;
@@ -434,9 +467,11 @@ void PicYuv::copyFromPicture(const x265_picture& pic, const x265_param& param, i
 
     /* extend the bottom if height was not multiple of the minimum CU size */
     Y = m_picOrg[0] + (height - 1) * m_stride;
+    // 在Y通道原始像素的最下方，直接整行copy最后一行像素，进行pady次操作
     for (int i = 1; i <= pady; i++)
         memcpy(Y + i * m_stride, Y, (width + padx) * sizeof(pixel));
 
+    // 以下if语句是针对色度分量（UV）通道的padding
     if (param.internalCsp != X265_CSP_I400)
     {
         for (int r = 0; r < height >> m_vChromaShift; r++)
