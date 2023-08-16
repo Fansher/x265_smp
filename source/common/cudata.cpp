@@ -1455,11 +1455,15 @@ bool CUData::hasEqualMotion(uint32_t absPartIdx, const CUData& candCU, uint32_t 
 }
 
 /* Construct list of merging candidates, returns count */
+/*
+*puIdx
+*/
 uint32_t CUData::getInterMergeCandidates(uint32_t absPartIdx, uint32_t puIdx, MVField(*candMvField)[2], uint8_t* candDir) const
 {
     uint32_t absPartAddr = m_absIdxInCTU + absPartIdx;
     const bool isInterB = m_slice->isInterB();
 
+    // 最大MergeCandidate个数，placebo和veryslow是5，slower是4，slow是3，其余preset是2
     const uint32_t maxNumMergeCand = m_slice->m_maxNumMergeCand;
 
     for (uint32_t i = 0; i < maxNumMergeCand; ++i)
@@ -1476,10 +1480,12 @@ uint32_t CUData::getInterMergeCandidates(uint32_t absPartIdx, uint32_t puIdx, MV
     int cuSize = 1 << m_log2CUSize[0];
     int partMode = m_partSize[0];
 
+    // 当前PU的宽度和高度
     int tmp = partTable[partMode][puIdx][0];
     nPSW = ((tmp >> 4) * cuSize) >> 2;
     nPSH = ((tmp & 0xF) * cuSize) >> 2;
 
+    // xP是PU top-left像素x坐标；yP是PU top-left像素y坐标
     tmp = partTable[partMode][puIdx][1];
     xP = ((tmp >> 4) * cuSize) >> 2;
     yP = ((tmp & 0xF) * cuSize) >> 2;
@@ -1489,9 +1495,18 @@ uint32_t CUData::getInterMergeCandidates(uint32_t absPartIdx, uint32_t puIdx, MV
     uint32_t partIdxLT, partIdxRT, partIdxLB = deriveLeftBottomIdx(puIdx);
     PartSize curPS = (PartSize)m_partSize[absPartIdx];
     
+    // Merge Candidate的PU搜索顺序：
+    // 空域最多提供4个：left(A1)->above(B1)->above(B0)->left bottom(A0)，当前面有不存在的情况下再考虑above left(B2)
+    // 之所以是这样的顺序是因为按照统计，上述PU与当前PU具备相同MV的概率依次降低
+    
     // left
     uint32_t leftPartIdx = 0;
     const CUData* cuLeft = getPULeft(leftPartIdx, partIdxLB);
+    // left(A1)可用的前提条件：
+    // 1. A1存在（边界PU则不存在A1）
+    // 2. A1与当前PU不属于同一merge
+    // 3. 当前PU不能是：PUIndex为1，其划分方式是Nx2N,nLx2N,nRx2N，因为一旦存在这种情况，其与PUIndex0的信息一样，则退化为与2Nx2N的情形
+    // 4. 存在的A1是intermode，这样A1才有MV
     bool isAvailableA1 = cuLeft &&
         cuLeft->isDiffMER(xP - 1, yP + nPSH - 1, xP, yP) &&
         !(puIdx == 1 && (curPS == SIZE_Nx2N || curPS == SIZE_nLx2N || curPS == SIZE_nRx2N)) &&
@@ -1514,6 +1529,8 @@ uint32_t CUData::getInterMergeCandidates(uint32_t absPartIdx, uint32_t puIdx, MV
     // above
     uint32_t abovePartIdx = 0;
     const CUData* cuAbove = getPUAbove(abovePartIdx, partIdxRT);
+    // 同样地，above(B1)可用的其中一个条件是：
+    // 当前PU不能是：PUIndex为1，其划分方式是2NxN,2NxnL,2NxnR，因为一旦存在这种情况，其与PUIndex0的信息一样，则退化为与2Nx2N的情形
     bool isAvailableB1 = cuAbove &&
         cuAbove->isDiffMER(xP + nPSW - 1, yP - 1, xP, yP) &&
         !(puIdx == 1 && (curPS == SIZE_2NxN || curPS == SIZE_2NxnU || curPS == SIZE_2NxnD)) &&
@@ -1591,6 +1608,9 @@ uint32_t CUData::getInterMergeCandidates(uint32_t absPartIdx, uint32_t puIdx, MV
                 return maxNumMergeCand;
         }
     }
+
+    // 时域MV候选列表的建立利用了当前PU在邻近已编码图像中对应位置PU（同位PU）的运动信息
+    // 与空域不同的是，此处不能直接利用候选块的运动信息，而需要根据与参考图像的位置关系作相应的比例伸缩调整
     if (m_slice->m_sps->bTemporalMVPEnabled)
     {
         uint32_t partIdxRB = deriveRightBottomIdx(puIdx);
@@ -1649,6 +1669,8 @@ uint32_t CUData::getInterMergeCandidates(uint32_t absPartIdx, uint32_t puIdx, MV
         }
     }
 
+    // 对于B Slice中的PU而言，由于存在两个MV，因此其MV候选列表也需要提供两个预测MV
+    // HEVC标准将MV候选列表中的前4个候选MV进行两两组合，产生了用于B Slice的组合列表
     if (isInterB)
     {
         const uint32_t cutoff = count * (count - 1);
@@ -1681,6 +1703,8 @@ uint32_t CUData::getInterMergeCandidates(uint32_t absPartIdx, uint32_t puIdx, MV
             }
         }
     }
+
+    // 若上述计算得到的候选MV个数仍然小于maxNumMergeCand，则补充零向量以达到maxNumMergeCand规定的数目
     int numRefIdx = (isInterB) ? X265_MIN(m_slice->m_numRefIdx[0], m_slice->m_numRefIdx[1]) : m_slice->m_numRefIdx[0];
     int r = 0;
     int refcnt = 0;
