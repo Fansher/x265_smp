@@ -303,7 +303,7 @@ void Search::codeCoeffQTChroma(const CUData& cu, uint32_t tuDepth, uint32_t absP
 }
 
 /*** 
- * 计算帧内预测（亮度分量）下的RDCost
+ * 对已经确定预测模式的CU进行变换编码计算RDCost，TU根据参数确定是否需要split
  * 根据传参进来的预测模式进行预测，然后进行变换、量化、反变换、反量化、重建，计算RDCost 
  * 完整编码得到严格意义上的bits开销和distortion（sse）开销
  ***/
