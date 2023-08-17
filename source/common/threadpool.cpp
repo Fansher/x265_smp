@@ -111,6 +111,7 @@ public:
     void awaken()           { m_wakeEvent.trigger(); }
 };
 
+// WorkerThread的主函数
 void WorkerThread::threadMain()
 {
     THREAD_NAME("Worker", m_id);
@@ -129,15 +130,18 @@ void WorkerThread::threadMain()
 
     SLEEPBITMAP_OR(&m_curJobProvider->m_ownerBitmap, idBit);
     SLEEPBITMAP_OR(&m_pool.m_sleepBitmap, idBit);
+    // 等待触发，只有触发后才会进行后面的语句
+    // 在tryWakeOne和tryBondPeers中才会被触发
     m_wakeEvent.wait();
 
     while (m_pool.m_isActive)
     {
+        // 该语句只会在PMODE、WeightAnalysis、PME、CostEstimateGroup、PreLookaheadGroup中才会被执行
         if (m_bondMaster)
         {
             m_bondMaster->processTasks(m_id);
             m_bondMaster->m_exitedPeerCount.incr();
-            m_bondMaster = NULL;
+            m_bondMaster = NULL; // 每个线程在执行上面的某个任务完成后，当前任务会被释放
         }
 
         do
@@ -179,33 +183,49 @@ void WorkerThread::threadMain()
     SLEEPBITMAP_OR(&m_pool.m_sleepBitmap, idBit);
 }
 
+// JobProvider（甲方）试图让ThreadPool（包工头）找一下是否有空闲可用的WorkerThread（工人）
+// 如果找到了，就将甲方和工人进行绑定，该工人只为该甲方服务（只会执行findJob）
+// 该函数目前只在以下三处被调用：
+// Lookahead::addPicture，FrameEncoder::compressFrame，FrameEncoder::processRowEncoder
 void JobProvider::tryWakeOne()
 {
+    // 试图在线程池中寻找是否有在sleep的线程，如果没有则直接返回
     int id = m_pool->tryAcquireSleepingThread(m_ownerBitmap, ALL_POOL_THREADS);
     if (id < 0)
     {
-        m_helpWanted = true;
+        m_helpWanted = true; //表示需要帮助（线程核）
         return;
     }
 
+    // 否则，找到了空闲可用的线程worker
     WorkerThread& worker = m_pool->m_workers[id];
+    // 此处是将WorkerThread与Provider进行绑定
     if (worker.m_curJobProvider != this) /* poaching */
     {
+        // 获取当前WorkerThread对应id的map（即对应位置标记为1）
         sleepbitmap_t bit = (sleepbitmap_t)1 << id;
         SLEEPBITMAP_AND(&worker.m_curJobProvider->m_ownerBitmap, ~bit);
         worker.m_curJobProvider = this;
         SLEEPBITMAP_OR(&worker.m_curJobProvider->m_ownerBitmap, bit);
     }
+    // 触发该WorkerThread
     worker.awaken();
 }
 
+// 在tryWakeOne中调用，则返回任何一个正在sleep的WorkerThread（工人）
+// 在tryBondPeers中调用，则返回当前JobProvider拥有且sleep的WorkerThread
+// firstTryBitmap表示当前JobProvider拥有的线程核（WorkerThread）
+// secondTryBitmap的值为全0或者全1
 int ThreadPool::tryAcquireSleepingThread(sleepbitmap_t firstTryBitmap, sleepbitmap_t secondTryBitmap)
 {
     unsigned long id;
 
+    // 当前JobProvider拥有且sleep的线程核数
     sleepbitmap_t masked = m_sleepBitmap & firstTryBitmap;
+    // 优先在JobProvider自身已拥有的WorkerThread中寻找sleep的
     while (masked)
     {
+        // 从masked最低位开始，返回第一个1的位置，这个位置就代表着是第几个线程核
         SLEEPBITMAP_CTZ(id, masked);
 
         sleepbitmap_t bit = (sleepbitmap_t)1 << id;
@@ -230,6 +250,10 @@ int ThreadPool::tryAcquireSleepingThread(sleepbitmap_t firstTryBitmap, sleepbitm
     return -1;
 }
 
+// 返回当前可用的核数
+// 区别于tryWakeOne，tryBondPeers需要唤醒maxPeers个线程数（WorkerThread）
+// 如果所有线程均处于工作状态，则无法唤醒任何线程，tryBondPeers就什么都执行不了
+// 否则，唤醒N个线程，这些线程会同时执行processTasks和findJob两个任务
 int ThreadPool::tryBondPeers(int maxPeers, sleepbitmap_t peerBitmap, BondedTaskGroup& master)
 {
     int bondCount = 0;

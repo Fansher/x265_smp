@@ -87,6 +87,8 @@ bool WaveFront::dequeueRow(int row)
     return !!(ATOMIC_AND(&m_internalDependencyBitmap[row >> 5], ~bit) & bit);
 }
 
+// WaveFront继承自JobProvider，也即WPP是甲方之一，其需求在下面findJob中体现出来
+// CTZ(m_internalDependencyBitmap[w] & m_externalDependencyBitmap[w])用于找到当前能编码块的最上边的CTU Row
 void WaveFront::findJob(int threadId)
 {
     unsigned long id;

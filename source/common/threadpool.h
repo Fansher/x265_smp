@@ -44,6 +44,18 @@ static const sleepbitmap_t ALL_POOL_THREADS = (sleepbitmap_t)-1;
 enum { MAX_POOL_THREADS = sizeof(sleepbitmap_t) * 8 };
 enum { INVALID_SLICE_PRIORITY = 10 }; // a value larger than any X265_TYPE_* macro
 
+// x265采用基于线程池（threadpool）的多线程机制，ThreadPool中包含众多的WorkerThread（m_workers），可由用户指定线程数确定数目
+// WorkerThread是独立的线程，是具体执行工作的线程，线程的主循环函数为WorkerThread::threadMain()
+// WorkerThread不会主动执行任务，除非JobProvider主动给WorkerThread派发任务
+// x265中的FrameEncoder、WPP、LookAhead均派生于JobProvider，findJob()函数
+
+// threadpool、WorkerThread和JobProvider的关系：
+// threadpool是包工头，WorkerThread是工人，threadpool（包工头）下有很多WorkerThread（工人）
+// 没活干的时候，工人处于休息（Sleep）的状态
+// JobProvider是甲方，当甲方手里有工程时，向threadpool（包工头）提需求（tryWakeOne）及对应的实施方法
+// threadpool收到请求后，找到空闲的WorkerThread，然后WorkerThread根据实际需求工作（findJob）
+
+
 // Frame level job providers. FrameEncoder and Lookahead derive from
 // this class and implement findJob()
 class JobProvider
