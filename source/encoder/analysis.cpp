@@ -135,6 +135,8 @@ void Analysis::destroy()
     X265_FREE(cacheCost);
 }
 
+// 根据slice类型进行帧内预测和帧间预测
+// 参数中的ctu是当前要处理的CTU，frame是当前CTU所在的帧，cuGeom则是存储当前CTU对应四叉树划分结构的数据结构
 Mode& Analysis::compressCTU(CUData& ctu, Frame& frame, const CUGeom& cuGeom, const Entropy& initialContext)
 {
     m_slice = ctu.m_slice;
@@ -223,6 +225,7 @@ Mode& Analysis::compressCTU(CUData& ctu, Frame& frame, const CUGeom& cuGeom, con
     }
     ProfileCUScope(ctu, totalCTUTime, totalCTUs);
 
+    // 根据slice类型，分为帧间预测和帧内预测
     if (m_slice->m_sliceType == I_SLICE)
     {
         x265_analysis_intra_data* intraDataCTU = m_frame->m_analysisData.intraData;
@@ -2762,6 +2765,7 @@ void Analysis::trainCU(const CUData& ctu, const CUGeom& cuGeom, const Mode& best
 }
 
 /* sets md.bestMode if a valid merge candidate is found, else leaves it NULL */
+// 只针对2Nx2N的merge预测技术，在这种模式下，CU、PU、TU均只有一个
 void Analysis::checkMerge2Nx2N_rd0_4(Mode& skip, Mode& merge, const CUGeom& cuGeom)
 {
     uint32_t depth = cuGeom.depth;
@@ -2799,6 +2803,7 @@ void Analysis::checkMerge2Nx2N_rd0_4(Mode& skip, Mode& merge, const CUGeom& cuGe
         safeX = m_slice->m_refFrameList[0][0]->m_encData->m_pir.pirEndCol * m_param->maxCUSize - 3;
         maxSafeMv = (safeX - tempPred->cu.m_cuPelX) * 4;
     }
+    // 遍历所有merge候选，选择最小的sa8dCost作为最优mv进行下一步RDO
     for (uint32_t i = 0; i < numMergeCand; ++i)
     {
         if (m_bFrameParallel)
@@ -2827,6 +2832,7 @@ void Analysis::checkMerge2Nx2N_rd0_4(Mode& skip, Mode& merge, const CUGeom& cuGe
             // skip merge candidates which reference beyond safe reference area
             continue;
 
+        // 当前候选mv（通过i标志）相关信息
         tempPred->cu.m_mvpIdx[0][0] = (uint8_t)i; // merge candidate ID is stored in L0 MVP idx
         X265_CHECK(m_slice->m_sliceType == B_SLICE || !(candDir[i] & 0x10), " invalid merge for P slice\n");
         tempPred->cu.m_interDir[0] = candDir[i];
@@ -2834,17 +2840,22 @@ void Analysis::checkMerge2Nx2N_rd0_4(Mode& skip, Mode& merge, const CUGeom& cuGe
         tempPred->cu.m_mv[1][0] = candMvField[i][1].mv;
         tempPred->cu.m_refIdx[0][0] = (int8_t)candMvField[i][0].refIdx;
         tempPred->cu.m_refIdx[1][0] = (int8_t)candMvField[i][1].refIdx;
+        // 调用motionCompensation进行预测，得到预测像素tempPred->predYuv
         motionCompensation(tempPred->cu, pu, tempPred->predYuv, true, m_bChromaSa8d && (m_csp != X265_CSP_I400 && m_frame->m_fencPic->m_picCsp != X265_CSP_I400));
 
+        // 计算使用当前mergeIdx时的bits开销
         tempPred->sa8dBits = getTUBits(i, numMergeCand);
+        // 调用sa8d计算残差的SAD，如果需要加上UV通道的distortion，则计算后累加
         tempPred->distortion = primitives.cu[sizeIdx].sa8d(fencYuv->m_buf[0], fencYuv->m_size, tempPred->predYuv.m_buf[0], tempPred->predYuv.m_size);
         if (m_bChromaSa8d && (m_csp != X265_CSP_I400 && m_frame->m_fencPic->m_picCsp != X265_CSP_I400))
         {
             tempPred->distortion += primitives.chroma[m_csp].cu[sizeIdx].sa8d(fencYuv->m_buf[1], fencYuv->m_csize, tempPred->predYuv.m_buf[1], tempPred->predYuv.m_csize);
             tempPred->distortion += primitives.chroma[m_csp].cu[sizeIdx].sa8d(fencYuv->m_buf[2], fencYuv->m_csize, tempPred->predYuv.m_buf[2], tempPred->predYuv.m_csize);
         }
+        // 计算sa8d下的RDCost（sa8dCost）
         tempPred->sa8dCost = m_rdCost.calcRdSADCost((uint32_t)tempPred->distortion, tempPred->sa8dBits);
 
+        // 择优选择代价最小的预测模式
         if (tempPred->sa8dCost < bestPred->sa8dCost)
         {
             bestSadCand = i;
@@ -2878,6 +2889,7 @@ void Analysis::checkMerge2Nx2N_rd0_4(Mode& skip, Mode& merge, const CUGeom& cuGe
         tempPred->sa8dBits = bestPred->sa8dBits;
         tempPred->predYuv.copyFromYuv(bestPred->predYuv);
 
+        // 计算真实的RDCost
         encodeResAndCalcRdInterCU(*tempPred, cuGeom);
 
         md.bestMode = tempPred->rdCost < bestPred->rdCost ? tempPred : bestPred;
@@ -3035,6 +3047,11 @@ void Analysis::checkMerge2Nx2N_rd5_6(Mode& skip, Mode& merge, const CUGeom& cuGe
     }
 }
 
+//*checkInter_rd0_4()和checkInter_rd5_6()函数高度相似，不同点在确定CU中的每个PU的最优预测后，计算当前Cu的RDCost方式
+//*checkInter_rd0_4()的计算方式：
+//****计算fencYUV和predYUV差值的Hadamard变换，以此得到distortion
+//****通过predInterSearch计算interMode的bits（interMode.sa8dBits=block_mode_bits + mvp_idx_bits + refIdx_bits + mvd_bits）
+//****通过distortion和bits计算RDCost（sa8dCost）
 void Analysis::checkInter_rd0_4(Mode& interMode, const CUGeom& cuGeom, PartSize partSize, uint32_t refMask[2])
 {
     interMode.initCosts();
@@ -3071,6 +3088,7 @@ void Analysis::checkInter_rd0_4(Mode& interMode, const CUGeom& cuGeom, PartSize 
             }
         }
     }
+    // 对CU的每一个PU都进行最优帧间预测决定，得到每个PU的mv信息，同时累加bits（interMode.sa8dBits）
     predInterSearch(interMode, cuGeom, m_bChromaSa8d && (m_csp != X265_CSP_I400 && m_frame->m_fencPic->m_picCsp != X265_CSP_I400), refMask);
 
     /* predInterSearch sets interMode.sa8dBits */
@@ -3100,11 +3118,18 @@ void Analysis::checkInter_rd0_4(Mode& interMode, const CUGeom& cuGeom, PartSize 
     }
 }
 
+//*checkInter_rd0_4()和checkInter_rd5_6()函数高度相似，不同点在确定CU中的每个PU的最优预测后，计算当前CU的RDCost方式
+//*checkInter_rd5_6()的计算方式：
+//****计算残差进行，然后通过对残差数据进行完整的变换、量化、熵编码、反量化变换后来重建编码帧（重构帧）
+//****得到重构帧后，计算rencYUV和fencYUV的distortion
+//****通过encodeResAndCalcRdInterCU计算bits = SkipFlag_bits + MergeIndex_bits或者bits = SkipFlag_bits + PredMode_bits + PartSize_bits + PredInfo_bits + Coeff_bits
+//****通过distortion和bits计算RDCost（严格意义上的RDCost）
 void Analysis::checkInter_rd5_6(Mode& interMode, const CUGeom& cuGeom, PartSize partSize, uint32_t refMask[2])
 {
     interMode.initCosts();
     interMode.cu.setPartSizeSubParts(partSize);
     interMode.cu.setPredModeSubParts(MODE_INTER);
+    // 得到预测方向的个数（P帧有一个参考列表，B帧有两个参考列表）
     int numPredDir = m_slice->isInterP() ? 1 : 2;
 
     if (m_param->analysisLoadReuseLevel > 1 && m_param->analysisLoadReuseLevel != 10 && m_reuseInterDataCTU)
@@ -3112,10 +3137,12 @@ void Analysis::checkInter_rd5_6(Mode& interMode, const CUGeom& cuGeom, PartSize 
         int refOffset = cuGeom.geomRecurId * 16 * numPredDir + partSize * numPredDir * 2;
         int index = 0;
 
+        // 当前CU的PU个数
         uint32_t numPU = interMode.cu.getNumPartInter(0);
         for (uint32_t puIdx = 0; puIdx < numPU; puIdx++)
         {
             MotionData* bestME = interMode.bestME[puIdx];
+            // 针对每个预测方向，加载每个PU的ref
             for (int32_t i = 0; i < numPredDir; i++)
                 bestME[i].ref = m_reuseRef[refOffset + index++];
         }
@@ -3126,7 +3153,9 @@ void Analysis::checkInter_rd5_6(Mode& interMode, const CUGeom& cuGeom, PartSize 
         uint32_t numPU = interMode.cu.getNumPartInter(0);
         for (uint32_t part = 0; part < numPU; part++)
         {
+            // 每一个PU的最佳预测MV
             MotionData* bestME = interMode.bestME[part];
+            // 针对每个预测方向，加载每个PU最佳预测MV相关信息（参考帧ref、mv和mvpIdx）
             for (int32_t i = 0; i < numPredDir; i++)
             {
                 int* ref = &m_reuseRef[i * m_frame->m_analysisData.numPartitions * m_frame->m_analysisData.numCUsInFrame];
@@ -3137,9 +3166,11 @@ void Analysis::checkInter_rd5_6(Mode& interMode, const CUGeom& cuGeom, PartSize 
         }
     }
 
+    // 对CU的每一个PU都进行最优帧间预测，得到每个PU的预测信息，并计算sa8dBits（在本段函数中这个值并没有卵用）
     predInterSearch(interMode, cuGeom, m_csp != X265_CSP_I400 && m_frame->m_fencPic->m_picCsp != X265_CSP_I400, refMask);
 
     /* predInterSearch sets interMode.sa8dBits, but this is ignored */
+    // 为当前CU进行残差编码（PU的最佳预测方向已由上一步得到），并计算RDCost
     encodeResAndCalcRdInterCU(interMode, cuGeom);
 
     if (m_param->analysisSaveReuseLevel > 1 && m_reuseInterDataCTU)

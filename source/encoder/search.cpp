@@ -2853,6 +2853,7 @@ void Search::encodeResAndCalcRdSkipCU(Mode& interMode)
     cu.clearCbf();
     cu.setTUDepthSubParts(0, 0, depth);
 
+    // skip模式没有残差数据，重建数据等于预测数据
     reconYuv->copyFromYuv(interMode.predYuv);
 
     // Luma
