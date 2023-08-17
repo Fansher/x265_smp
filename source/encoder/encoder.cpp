@@ -1726,6 +1726,9 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
 
         Frame *inFrame;
         x265_param *p = (m_reconfigure || m_reconfigureRc) ? m_latestParam : m_param;
+        // 获取一个Frame类型结构体用于保存传进来的帧数据
+        // 如果m_freeList[]队列为空，则调用create()创建一个新的
+        // 如果m_freeList[]队列不为空，则调用popBack()从m_freeList[]队列取一个现成的
         if (m_dpb->m_freeList.empty())
         {
             inFrame = new Frame;
@@ -1797,6 +1800,7 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
         }
 
         /* Copy input picture into a Frame and PicYuv, send to lookahead */
+        // 将外部输入的帧数据，拷贝至Frame结构体中
         inFrame->m_fencPic->copyFromPicture(*inputPic, *m_param, m_sps.conformanceWindow.rightOffset, m_sps.conformanceWindow.bottomOffset);
 
         inFrame->m_poc       = ++m_pocLast;
@@ -1852,6 +1856,7 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
             memcpy(inFrame->m_rpu.payload, inputPic->rpu.payload, inputPic->rpu.payloadSize);
         }
 
+        // 自适应量化，保存量化偏移量的指针（确定量化值会用到该指针）
         if (inputPic->quantOffsets != NULL)
         {
             int cuCount;
@@ -1862,6 +1867,7 @@ int Encoder::encode(const x265_picture* pic_in, x265_picture* pic_out)
             memcpy(inFrame->m_quantOffsets, inputPic->quantOffsets, cuCount * sizeof(float));
         }
 
+        // 前面对m_pocLast有+1操作，此时表示当前帧位置。等于0时说明当前帧是第一帧
         if (m_pocLast == 0)
             m_firstPts = inFrame->m_pts;
         if (m_bframeDelay && m_pocLast == m_bframeDelay)

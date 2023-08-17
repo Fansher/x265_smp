@@ -103,10 +103,14 @@ void FrameEncoder::destroy()
     }
 }
 
+/*
+* 初始化FrameEncoder
+*/
 bool FrameEncoder::init(Encoder *top, int numRows, int numCols)
 {
     m_top = top;
     m_param = top->m_param;
+    // 一帧的CTU行数和列数
     m_numRows = numRows;
     m_numCols = numCols;
     m_reconfigure = false;
@@ -114,9 +118,11 @@ bool FrameEncoder::init(Encoder *top, int numRows, int numCols)
                         || (!m_param->bEnableLoopFilter && m_param->bEnableSAO)) ?
                         2 : (m_param->bEnableSAO || m_param->bEnableLoopFilter ? 1 : 0);
     m_filterRowDelayCus = m_filterRowDelay * numCols;
+    // m_rows[]的大小是一帧的CTU行数（WPP并行技术在熵编码时可能同时处理多行数据）
     m_rows = new CTURow[m_numRows];
     bool ok = !!m_numRows;
 
+    // m_sliceBaseRow指针内存空间大小等于最大slice数目加1
     m_sliceBaseRow = X265_MALLOC(uint32_t, m_param->maxSlices + 1);
     m_bAllRowsStop = X265_MALLOC(bool, m_param->maxSlices);
     m_vbvResetTriggerRow = X265_MALLOC(int, m_param->maxSlices);
@@ -542,7 +548,9 @@ void FrameEncoder::compressFrame()
 
     if (m_param->analysisSave && (bUseWeightP || bUseWeightB))
         reuseWP = (WeightParam*)m_frame->m_analysisData.wt;
+
     // Generate motion references
+    // numPreDir表示当前有几个参考list，P帧有一个前向参考列表，B帧有两个参考列表，I帧没有
     int numPredDir = slice->isInterP() ? 1 : slice->isInterB() ? 2 : 0;
     for (int l = 0; l < numPredDir; l++)
     {
@@ -570,6 +578,7 @@ void FrameEncoder::compressFrame()
 
     /* Get the QP for this frame from rate control. This call may block until
      * frames ahead of it in encode order have called rateControlEnd() */
+    // 根据码率控制确定QP的大小
     int qp = m_top->m_rateControl->rateControlStart(m_frame, &m_rce, m_top);
     m_rce.newQp = qp;
 
@@ -640,6 +649,7 @@ void FrameEncoder::compressFrame()
     // reset slice counter for rate control update
     m_sliceCnt = 0;
 
+    // 根据是否使用WPP并行技术，申请空间
     uint32_t numSubstreams = m_param->bEnableWavefront ? slice->m_sps->numCuInHeight : m_param->maxSlices;
     X265_CHECK(m_param->bEnableWavefront || (m_param->maxSlices == 1), "Multiple slices without WPP unsupport now!");
     if (!m_outStreams)
@@ -812,9 +822,11 @@ void FrameEncoder::compressFrame()
      * compressed in a wave-front pattern if WPP is enabled. Row based loop
      * filters runs behind the CTU compression and reconstruction */
 
+    // 触发每一个slice的第一个CTU行，slice间是独立编码
     for (uint32_t sliceId = 0; sliceId < m_param->maxSlices; sliceId++)    
         m_rows[m_sliceBaseRow[sliceId]].active = true;
     
+    // 如果可以使用WPP并行技术，计算各m_row_to_idx[]和m_idx_to_row[]
     if (m_param->bEnableWavefront)
     {
         int i = 0;
@@ -822,8 +834,11 @@ void FrameEncoder::compressFrame()
         {
             for (uint32_t sliceId = 0; sliceId < m_param->maxSlices; sliceId++)
             {
+                // 当前slice的起始CTU行
                 const uint32_t sliceStartRow = m_sliceBaseRow[sliceId];
+                // 当前slice的末尾CTU行（也就是下一个slice起始CTU行的上一CTU行）
                 const uint32_t sliceEndRow = m_sliceBaseRow[sliceId + 1] - 1;
+                // 当前slice的rowInSlice行在整帧中的CTU行号
                 const uint32_t row = sliceStartRow + rowInSlice;
                 if (row > sliceEndRow)
                     continue;
@@ -836,6 +851,7 @@ void FrameEncoder::compressFrame()
 
     if (m_param->bEnableWavefront)
     {
+        // m_sliceGroupSize表示一个slice有多少个CTU行；maxSlices表示一帧数据有多少个slice
         for (uint32_t rowInSlice = 0; rowInSlice < m_sliceGroupSize; rowInSlice++)
         {
             for (uint32_t sliceId = 0; sliceId < m_param->maxSlices; sliceId++)
@@ -850,6 +866,7 @@ void FrameEncoder::compressFrame()
                     continue;
 
                 // block until all reference frames have reconstructed the rows we need
+                // 只有当当前行所需要的参考信息全部重建完毕，才能开始下一步
                 for (int l = 0; l < numPredDir; l++)
                 {
                     for (int ref = 0; ref < slice->m_numRefIdx[l]; ref++)
@@ -859,6 +876,7 @@ void FrameEncoder::compressFrame()
                         // NOTE: we unnecessary wait row that beyond current slice boundary
                         const int rowIdx = X265_MIN(sliceEndRow, (row + m_refLagRows));
 
+                        // 如果参考帧对应信息标记不可用时，则需要等待信号量后再执行
                         while (refpic->m_reconRowFlag[rowIdx].get() == 0)
                             refpic->m_reconRowFlag[rowIdx].waitForChange(0);
 
@@ -870,10 +888,11 @@ void FrameEncoder::compressFrame()
                 enableRowEncoder(m_row_to_idx[row]); /* clear external dependency for this row */
                 if (!rowInSlice)
                 {
+                    // 如果是Slice的第一行，获取当前开始编码的时间点；同时标记当前行对应位置，表示可以执行编码操作
                     m_row0WaitTime = x265_mdate();
                     enqueueRowEncoder(m_row_to_idx[row]); /* clear internal dependency, start wavefront */
                 }
-                tryWakeOne();
+                tryWakeOne(); // CTU行准备好并触发WPP，准备在findjob中运行
             } // end of loop rowInSlice
         } // end of loop sliceId
 
@@ -883,6 +902,7 @@ void FrameEncoder::compressFrame()
         while (m_completionEvent.timedWait(block_ms))
             tryWakeOne();
     }
+    // 如果不使用WPP并行技术
     else
     {
         for (uint32_t i = 0; i < m_numRows + m_filterRowDelay; i++)
