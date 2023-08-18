@@ -38,6 +38,10 @@ class Slice;
 struct TUEntropyCodingParameters;
 struct CUDataMemPool;
 
+// 对于一个2Nx2N的CU，其预测模式的运动分区
+// 帧内预测单元：只有2Nx2N和NxN两种
+// 帧间预测单元: 对称式（2Nx2N、2NxN、Nx2N、NxN）、非对称式（2NxnU、2NxnD、nLx2N、nRx2N）
+// 注意：PartSize不区分帧内还是帧间（SKIP也属于帧间），只对应分区的大小
 enum PartSize
 {
     SIZE_2Nx2N, // symmetric motion partition,  2Nx2N
@@ -51,6 +55,7 @@ enum PartSize
     NUM_SIZES
 };
 
+// 编码预测单元：帧内预测、帧间预测、SKIP（帧间预测的一种）
 enum PredMode
 {
     MODE_NONE  = 0,
@@ -70,6 +75,7 @@ enum MVP_DIR
     MD_COLLOCATED   // MVP of temporal neighbour
 };
 
+// CUGeom表示当前CU的几何划分
 struct CUGeom
 {
     enum {
@@ -83,11 +89,17 @@ struct CUGeom
     // (1 + 4 + 16 + 64) = 85.
     enum { MAX_GEOMS = 85 };
 
+    // 当前CU的大小
     uint32_t log2CUSize;    // Log of the CU size.
+    // 当前CU相对所在CTU的第一个CU的索引差
     uint32_t childOffset;   // offset of the first child CU from current CU
+    // 按4x4大小划分CTU时，当前CU左上角在CTU的索引顺序（zigzag遍历方式）
     uint32_t absPartIdx;    // Part index of this CU in terms of 4x4 blocks.
+    // 当前CU按4x4大小进行划分的数量
     uint32_t numPartitions; // Number of 4x4 blocks in the CU
+    // 取值为上面的枚举类型：SPLIT_MANDATORY表示当前CU要强制划分，LEAF表示当前CU处于CTU的最深深度（四叉树中的叶子节点）
     uint32_t flags;         // CU flags.
+    // 当前CU在CTU中的划分深度
     uint32_t depth;         // depth of this CU relative from CTU
     uint32_t geomRecurId;   // Unique geom id from 0 to MAX_GEOMS - 1 for every depth
 };
@@ -162,24 +174,30 @@ class CUData
 public:
 
     cubcast_t s_partSet[NUM_FULL_DEPTH]; // pointer to broadcast set functions per absolute depth
+    // 一个CTU每行或者每列有多少个4x4块
     uint32_t  s_numPartInCUSize;
 
     bool          m_vbvAffected;
 
-    FrameData*    m_encData;
-    const Slice*  m_slice;
+    FrameData*    m_encData; // 当前CU对应帧的帧编码数据
+    const Slice*  m_slice; //当前CU所处Slice数据
 
     cucopy_t      m_partCopy;         // pointer to function that copies m_numPartitions elements
     cubcast_t     m_partSet;          // pointer to function that sets m_numPartitions elements
     cucopy_t      m_subPartCopy;      // pointer to function that copies m_numPartitions/4 elements, may be NULL
     cubcast_t     m_subPartSet;       // pointer to function that sets m_numPartitions/4 elements, may be NULL
 
+    // 当前CU对应的CTU在帧中的编号
     uint32_t      m_cuAddr;           // address of CTU within the picture in raster order
+    // 当前CU（左上角）在CTU中的（按照4x4划分）编号
     uint32_t      m_absIdxInCTU;      // address of CU within its CTU in Z scan order
+    // 当前CU左上角对应的点在图片帧上的像素点X、Y坐标
     uint32_t      m_cuPelX;           // CU position within the picture, in pixels (X)
     uint32_t      m_cuPelY;           // CU position within the picture, in pixels (Y)
+    // 当前CU以4x4大小划分的个数
     uint32_t      m_numPartitions;    // maximum number of 4x4 partitions within this CU
 
+    // 示例：对于420格式，色度宽高均是亮度的一半，以下3个值均为1，表示需要右移一位
     uint32_t      m_chromaFormat;
     uint32_t      m_hChromaShift;
     uint32_t      m_vChromaShift;
@@ -190,11 +208,12 @@ public:
     uint8_t      m_bLastCuInSlice;
 
     /* Per-part data, stored contiguously */
+    // 以下空间均按当前CU以4x4块划分得到的个数进行存储
     int8_t*       m_qp;               // array of QP values
     int8_t*       m_qpAnalysis;       // array of QP values for analysis reuse
     uint8_t*      m_log2CUSize;       // array of cu log2Size TODO: seems redundant to depth
     uint8_t*      m_lumaIntraDir;     // array of intra directions (luma)
-    uint8_t*      m_tqBypass;         // array of CU lossless flags
+    uint8_t*      m_tqBypass;         // array of CU lossless flags（对残差不进行变换量化及滤波）
     int8_t*       m_refIdx[2];        // array of motion reference indices per list
     uint8_t*      m_cuDepth;          // array of depths
     uint8_t*      m_predMode;         // array of prediction modes
@@ -217,6 +236,7 @@ public:
     MV*           m_mvd[2];           // array of coded motion vector deltas per list
     enum { TMVP_UNIT_MASK = 0xF0 };  // mask for mapping index to into a compressed (reference) MV field
 
+    // 分别指向当前CTU的左上方、右上方、上方和左方的CTU（CTU不存在则为null）
     const CUData* m_cuAboveLeft;      // pointer to above-left neighbor CTU
     const CUData* m_cuAboveRight;     // pointer to above-right neighbor CTU
     const CUData* m_cuAbove;          // pointer to above neighbor CTU

@@ -602,27 +602,48 @@ void CUData::updatePic(uint32_t depth, int picCsp) const
     }
 }
 
+// 函数返回左侧参考像素所在的CTU或者CU结构
+// 同时获取左侧参考像素对应的4x4块（下同）在CTU/CU中的zigzag标号(保存在lPartUnitIdx中)：
+// 1. 参考像素不在当前CTU，返回参考像素块在其所在CTU（当前CTU的左侧CTU）中的zigzag标号
+// 2. 参考像素在当前CTU，但不在当前CU，返回参考像素块在当前CTU中的zigzag标号
+// 3. 参考像素在当前CU，返回参考像素块在当前CU中的zigzag标号
+// 注：1、2都是在CTU中的标号，而3是在CU中的标号
+// curPartUnitIdx是当前块（做预测会用到相邻像素，一般是PU块）在CTU中的zigzag标号
 const CUData* CUData::getPULeft(uint32_t& lPartUnitIdx, uint32_t curPartUnitIdx) const
 {
+    // 当前块zigzag扫描标号转换成光栅扫描标号（均基于当前CTU得到的标号）
     uint32_t absPartIdx = g_zscanToRaster[curPartUnitIdx];
 
+    // 如果当前块不处于所在CTU的第一列，说明当前块的左侧参考像素在当前CTU中
     if (!isZeroCol(absPartIdx))
     {
+        // 当前块（PU预测块）所在的CU的zigzag扫描标号转换为光栅扫描标号（基于当前CTU）
         uint32_t absZorderCUIdx   = g_zscanToRaster[m_absIdxInCTU];
+        // 先获取左边参考像素所在块的光栅扫描顺序(absPartIdx - 1)，然后转换成zigzag扫描顺序（相对当前CTU）
         lPartUnitIdx = g_rasterToZscan[absPartIdx - 1];
+        // 如果当前块（一般是PU预测块）与其对应的CU最左边像素在同一列，说明参考像素不在对应的CU内，返回当前CTU（不在对应的CU，但是在对应的CTU内！）
         if (isEqualCol(absPartIdx, absZorderCUIdx))
             return m_encData->getPicCTU(m_cuAddr);
         else
         {
+            // 否则，参考像素块和当前块处于同一个CU,直接返回当前CU
+            // 相对当前CU（注意区别于上面的CTU，所以减去m_absIdxInCTU）的zigzag标号
             lPartUnitIdx -= m_absIdxInCTU;
             return this;
         }
     }
 
+    // 否则，当前块的左侧参考像素在左边CTU中，返回当前CTU的左侧CTU（m_cuLeft）
     lPartUnitIdx = g_rasterToZscan[absPartIdx + s_numPartInCUSize - 1];
     return m_cuLeft;
 }
 
+// 函数返回上方参考像素所在的CTU或者CU结构
+// 同时获取上方参考像素对应的4x4块（下同）在CTU/CU中的zigzag标号（保存在aPartUnitIdx中）：
+// 1. 参考像素不在当前CTU，返回参考像素块在其所在CTU（当前CTU的上方CTU）中的zigzag标号
+// 2. 参考像素在当前CTU，但不在当前CU，返回参考像素块在当前CTU中的zigzag标号
+// 3. 参考像素在当前CU，返回参考像素块在当前CU中的zigzag标号
+// curPartUnitIdx是当前块（做预测会用到相邻像素，一般是PU块）在CTU中的zigzag标号
 const CUData* CUData::getPUAbove(uint32_t& aPartUnitIdx, uint32_t curPartUnitIdx) const
 {
     uint32_t absPartIdx = g_zscanToRaster[curPartUnitIdx];
@@ -642,34 +663,54 @@ const CUData* CUData::getPUAbove(uint32_t& aPartUnitIdx, uint32_t curPartUnitIdx
     return m_cuAbove;
 }
 
+// 函数返回左上方参考像素所在的CTU或者CU
+// 具体参数和返回情形，与上述函数相同
 const CUData* CUData::getPUAboveLeft(uint32_t& alPartUnitIdx, uint32_t curPartUnitIdx) const
 {
+    // 将当前块的zigzag扫描顺序转换为光栅扫描顺序
     uint32_t absPartIdx = g_zscanToRaster[curPartUnitIdx];
 
+    // 如果当前块不在CTU的第一列
     if (!isZeroCol(absPartIdx))
     {
+        // 如果当前块不在CTU的第一行（既不在第一列也不在第一行），则左上方参考像素在当前CTU中
         if (!isZeroRow(absPartIdx))
         {
+            // 将当前块（一般是PU预测块）所在的CU在当前CTU中的zigzag标号转换为光栅标号
             uint32_t absZorderCUIdx  = g_zscanToRaster[m_absIdxInCTU];
+            // 先求出左上方参考像素的光栅标号（absPartIdx - RASTER_SIZE - 1）
+            // 再将光栅标号转换为zigzag标号
             alPartUnitIdx = g_rasterToZscan[absPartIdx - RASTER_SIZE - 1];
+            // 如果当前块（PU预测块）和当前CU在同一行或者同一列，那么参考像素不能当前CU中，返回当前CTU
             if (isEqualRowOrCol(absPartIdx, absZorderCUIdx))
                 return m_encData->getPicCTU(m_cuAddr);
             else
             {
+                // 否则，参考像素在当前CU中，返回当前CU
+                // 当前块在CTU中的zigzag标号，减去当前CU在CTU中的zigzag标号，得到当前块在当前CU中的zigzag标号
                 alPartUnitIdx -= m_absIdxInCTU;
                 return this;
             }
         }
+        // 否则，当前块在CTU的第一行，但不在第一列，则左上方参考像素在当前CTU的上方(返回m_cuAbove)
+        // 左上方参考像素在其CTU的最后一行，因此光栅标号base为(s_numPartInCUSize - 1) << LOG2_RASTER_SIZE)
+        // 参考像素相对当前块左移一个标号（不考虑垂直方向），因此offset为absPartIdx-1
+        // base + offset为左上方参考像素块的光栅标号，转换成zigzag标号即可
         alPartUnitIdx = g_rasterToZscan[absPartIdx + ((s_numPartInCUSize - 1) << LOG2_RASTER_SIZE) - 1];
         return m_cuAbove;
     }
 
     if (!isZeroRow(absPartIdx))
     {
+        // 如果函数走到这一步，说明当前块在CTU的第一列，但不在第一行，则左上方参考像素在当前CTU的左方(返回m_cuLeft)
+        // absPartIdx + s_numPartInCUSize - 1是当前块所在行最后一个块光栅标号
+        // 上面的值减去RASTER_SIZE，得到上一行的最后一个块光栅标号，等同于是左上方参考像素的光栅标号
         alPartUnitIdx = g_rasterToZscan[absPartIdx - RASTER_SIZE + s_numPartInCUSize - 1];
         return m_cuLeft;
     }
 
+    // 如果函数走到这一步，说明当前块在CTU的第一行第一列，也就是当前块在当前CTU的第一个4x4块
+    // 则左上方参考像素在当前块的左上方(返回m_cuAboveLeft)，zigzag值就是CTU的最后一个zigzag标号
     alPartUnitIdx = m_encData->m_param->num4x4Partitions - 1;
     return m_cuAboveLeft;
 }

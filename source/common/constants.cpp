@@ -167,6 +167,8 @@ uint32_t g_unitSizeDepth = NUM_CU_DEPTH;
 uint32_t g_maxCUDepth    = NUM_CU_DEPTH - 1;
 uint32_t g_maxSlices     = 1;
 
+// CU采用递归的四叉树划分结构，zscan扫描可以很好的使用这种编码结构，有利于CU的寻址
+// 光栅扫描，也即逐行扫描，容易计算X、Y坐标，有利于像素点的寻址
 const uint32_t g_zscanToRaster[MAX_NUM_PARTITIONS] =
 {
     0x00, 0x01, 0x10, 0x11, 0x02, 0x03, 0x12, 0x13, 0x20, 0x21, 0x30, 0x31, 0x22, 0x23, 0x32, 0x33,
