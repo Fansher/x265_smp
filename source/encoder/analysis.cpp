@@ -135,12 +135,13 @@ void Analysis::destroy()
     X265_FREE(cacheCost);
 }
 
-// 根据slice类型进行帧内预测和帧间预测
+// 根据slice类型进行帧内编码和帧间编码
 // 参数中的ctu是当前要处理的CTU，frame是当前CTU所在的帧，cuGeom则是存储当前CTU对应四叉树划分结构的数据结构
 Mode& Analysis::compressCTU(CUData& ctu, Frame& frame, const CUGeom& cuGeom, const Entropy& initialContext)
 {
     m_slice = ctu.m_slice;
     m_frame = &frame;
+    // 如果rdLevel（可取值0~6）不小于3，计算sa8dCost时需要考虑色度分量
     m_bChromaSa8d = m_param->rdLevel >= 3;
     m_param = m_frame->m_param;
 
@@ -151,6 +152,7 @@ Mode& Analysis::compressCTU(CUData& ctu, Frame& frame, const CUGeom& cuGeom, con
     int qp = setLambdaFromQP(ctu, m_slice->m_pps->bUseDQP ? calculateQpforCuSize(ctu, cuGeom) : m_slice->m_sliceQp);
     ctu.setQPSubParts((int8_t)qp, 0, 0);
 
+    // 初始化四叉树划分结构上下文，初始深度为0
     m_rqt[0].cur.load(initialContext);
     ctu.m_meanQP = initialContext.m_meanQP;
     m_modeDepth[0].fencYuv.copyFromPicYuv(*m_frame->m_fencPic, ctu.m_cuAddr, 0);
@@ -158,7 +160,12 @@ Mode& Analysis::compressCTU(CUData& ctu, Frame& frame, const CUGeom& cuGeom, con
     if (m_param->bSsimRd)
         calculateNormFactor(ctu, qp);
 
+    // 当前CTU按照4x4块大小划分，一共有多少个划分数
     uint32_t numPartition = ctu.m_numPartitions;
+    // （以下3个if语句）是否有编码信息输入来方便快速进行最优模式分析
+    // **bCTUInfo，加载depth/content/prevCtuInfoChange
+    // **analysisMultiPassRefine，加载之前pass编码计算分析得到的mv/mvpIdx/ref/modes/depth
+    // **analysisLoad，加载load数据中的ref/depth/modes/partSize/mergeFlag
     if (m_param->bCTUInfo && (*m_frame->m_ctuInfo + ctu.m_cuAddr))
     {
         x265_ctu_info_t* ctuTemp = *m_frame->m_ctuInfo + ctu.m_cuAddr;
@@ -225,7 +232,7 @@ Mode& Analysis::compressCTU(CUData& ctu, Frame& frame, const CUGeom& cuGeom, con
     }
     ProfileCUScope(ctu, totalCTUTime, totalCTUs);
 
-    // 根据slice类型，分为帧间预测和帧内预测
+    // 根据slice类型，分为帧间预测编码和帧内预测编码
     if (m_slice->m_sliceType == I_SLICE)
     {
         x265_analysis_intra_data* intraDataCTU = m_frame->m_analysisData.intraData;
@@ -236,6 +243,7 @@ Mode& Analysis::compressCTU(CUData& ctu, Frame& frame, const CUGeom& cuGeom, con
             memcpy(ctu.m_partSize, &intraDataCTU->partSizes[ctu.m_cuAddr * numPartition], sizeof(char) * numPartition);
             memcpy(ctu.m_chromaIntraDir, &intraDataCTU->chromaModes[ctu.m_cuAddr * numPartition], sizeof(uint8_t) * numPartition);
         }
+        // 帧内预测及编码入口
         compressIntraCU(ctu, cuGeom, qp);
     }
     else
@@ -247,14 +255,18 @@ Mode& Analysis::compressCTU(CUData& ctu, Frame& frame, const CUGeom& cuGeom, con
 
         if (bCopyAnalysis)
         {
+            // 读取当前CTU所在帧的interData用于后续帧间编码
             x265_analysis_inter_data* interDataCTU = m_frame->m_analysisData.interData;
+            // CTU所在位置下标
             int posCTU = ctu.m_cuAddr * numPartition;
+            // interDataCTU保存的是整帧的帧间编码信息，拷贝cuDepth/predMode/partSize/skipFlag到当前CTU中，用于后续帧间编码
             memcpy(ctu.m_cuDepth, &interDataCTU->depth[posCTU], sizeof(uint8_t) * numPartition);
             memcpy(ctu.m_predMode, &interDataCTU->modes[posCTU], sizeof(uint8_t) * numPartition);
             memcpy(ctu.m_partSize, &interDataCTU->partSize[posCTU], sizeof(uint8_t) * numPartition);
             for (int list = 0; list < m_slice->isInterB() + 1; list++)
                 memcpy(ctu.m_skipFlag[list], &m_frame->m_analysisData.modeFlag[list][posCTU], sizeof(uint8_t) * numPartition);
 
+            // 如果是PSlice或者开启帧内预测的BSlice，说明当前帧也允许帧内编码，当前CTU还需要拷贝intraDataCTU相关信息
             if ((m_slice->m_sliceType == P_SLICE || m_param->bIntraInBFrames) && !(m_param->bAnalysisType == AVC_INFO))
             {
                 x265_analysis_intra_data* intraDataCTU = m_frame->m_analysisData.intraData;
@@ -1161,6 +1173,7 @@ uint32_t Analysis::compressInterCU_dist(const CUData& parentCTU, const CUGeom& c
     return refMask;
 }
 
+// rdLevel等于0~4时的帧间预测编码
 SplitData Analysis::compressInterCU_rd0_4(const CUData& parentCTU, const CUGeom& cuGeom, int32_t qp)
 {
     if (parentCTU.m_vbvAffected && calculateQpforCuSize(parentCTU, cuGeom, 1))
@@ -1321,12 +1334,14 @@ SplitData Analysis::compressInterCU_rd0_4(const CUData& parentCTU, const CUGeom&
             }
         }
         /* Step 1. Evaluate Merge/Skip candidates for likely early-outs, if skip mode was not set above */
+        // 第一步：计算Merge和Skip模式的RDCost，判断是否可以提前终止递归划分
         if ((mightNotSplit && depth >= minDepth && !md.bestMode && !bCtuInfoCheck) || (m_param->bAnalysisType == AVC_INFO && m_param->analysisLoadReuseLevel == 7 && (m_modeFlag[0] || m_modeFlag[1])))
             /* TODO: Re-evaluate if analysis load/save still works */
         {
             /* Compute Merge Cost */
             md.pred[PRED_MERGE].cu.initSubCU(parentCTU, cuGeom, qp);
             md.pred[PRED_SKIP].cu.initSubCU(parentCTU, cuGeom, qp);
+            // 当前块不进行划分，计算merge和skip的RDCost
             checkMerge2Nx2N_rd0_4(md.pred[PRED_SKIP], md.pred[PRED_MERGE], cuGeom);
             if (m_param->rdLevel)
                 skipModes = (m_param->bEnableEarlySkip || m_refineLevel == 2)
@@ -1334,9 +1349,14 @@ SplitData Analysis::compressInterCU_rd0_4(const CUData& parentCTU, const CUGeom&
         }
         if (md.bestMode && m_param->recursionSkipMode && !bCtuInfoCheck && !(m_param->bAnalysisType == AVC_INFO && m_param->analysisLoadReuseLevel == 7 && (m_modeFlag[0] || m_modeFlag[1])))
         {
+            // checkMerge2Nx2N_rd0_4已经比较过了merge和skip，如果skip不是最优模式，则执行下面过程
+            // skipRecursion值为true表示最优模式是skip，意味着当前块不需要再递归划分判断
             skipRecursion = md.bestMode->cu.isSkipped(0);
+            // 如果上面得到的skipRecursion为flase，我们需要进一步用其他法子判断是否需要递归划分
             if (mightSplit && !skipRecursion)
             {
+                // 判断是否需要进一步划分进行skip判断
+                // 有两种方法：recursionDepthCheck(基于rd-cost判断) /complexityCheckCU(基于纹理平坦度)
                 if (depth >= minDepth && m_param->recursionSkipMode == RDCOST_BASED_RSKIP)
                 {
                     if (depth)
@@ -1351,9 +1371,14 @@ SplitData Analysis::compressInterCU_rd0_4(const CUData& parentCTU, const CUGeom&
 
             }
         }
+        // 极限条件下也不需要继续划分了
         if (m_param->bAnalysisType == AVC_INFO && md.bestMode && cuGeom.numPartitions <= 16 && m_param->analysisLoadReuseLevel == 7)
             skipRecursion = true;
+        
         /* Step 2. Evaluate each of the 4 split sub-blocks in series */
+        // 第二步：
+        // 如果skipRecursion为true，表示不需要继续递归划分，下列if语句不用执行
+        // 如果skipRecursion为false，同时mightSplit，当前块就需要按照四叉树划分，并计算划分时每个子块的预测代价
         if (mightSplit && !skipRecursion)
         {
             if (bCtuInfoCheck && m_param->bCTUInfo & 2)
@@ -1425,7 +1450,10 @@ SplitData Analysis::compressInterCU_rd0_4(const CUData& parentCTU, const CUGeom&
          *   0  1
          *   2  3 */
         uint32_t allSplitRefs = splitData[0].splitRefs | splitData[1].splitRefs | splitData[2].splitRefs | splitData[3].splitRefs;
+        
         /* Step 3. Evaluate ME (2Nx2N, rect, amp) and intra modes at current depth */
+        // 第三步：计算在当前划分深度下对各种划分方式计算运动估计代价等
+        // 如果
         if (mightNotSplit && (depth >= minDepth || (m_param->bCTUInfo && !md.bestMode)))
         {
             if (m_slice->m_pps->bUseDQP && depth <= m_slice->m_pps->maxCuDQPDepth && m_slice->m_pps->maxCuDQPDepth != 0)
@@ -1436,6 +1464,9 @@ SplitData Analysis::compressInterCU_rd0_4(const CUData& parentCTU, const CUGeom&
                 uint32_t refMasks[2];
                 refMasks[0] = allSplitRefs;
                 md.pred[PRED_2Nx2N].cu.initSubCU(parentCTU, cuGeom, qp);
+                // intermode=2Nx2N时 AMVP的计算，包含运动估计和运动补偿
+                // merge和skip在checkMerge2Nx2N_rd0_4中已经完成
+                // checkInter_rd0_4主要进行AMVP相关的运动估计和运动补偿
                 checkInter_rd0_4(md.pred[PRED_2Nx2N], cuGeom, SIZE_2Nx2N, refMasks);
 
                 if (m_param->limitReferences & X265_REF_LIMIT_CU)
@@ -1452,8 +1483,10 @@ SplitData Analysis::compressInterCU_rd0_4(const CUData& parentCTU, const CUGeom&
                 }
 
                 Mode *bestInter = &md.pred[PRED_2Nx2N];
+                // 允许矩形分区的预测
                 if (!skipRectAmp)
                 {
+                    // 2Nxn/nX2N预测模式
                     if (m_param->bEnableRectInter)
                     {
                         uint64_t splitCost = splitData[0].sa8dCost + splitData[1].sa8dCost + splitData[2].sa8dCost + splitData[3].sa8dCost;
@@ -1504,6 +1537,7 @@ SplitData Analysis::compressInterCU_rd0_4(const CUData& parentCTU, const CUGeom&
                         }
                     }
 
+                    // nRx2N/nLx2N/2NxnD/2NxnU预测模式
                     if (m_slice->m_sps->maxAMPDepth > depth)
                     {
                         uint64_t splitCost = splitData[0].sa8dCost + splitData[1].sa8dCost + splitData[2].sa8dCost + splitData[3].sa8dCost;
@@ -1610,6 +1644,9 @@ SplitData Analysis::compressInterCU_rd0_4(const CUData& parentCTU, const CUGeom&
                         }
                     }
                 }
+
+                // BP帧内的块不一定全部是帧间预测模式，也可以选择帧内预测模式
+                // 如果是PSlice，或者B帧情况下，可以将帧内编码纳入考虑，调用checkIntraInInter/encodeIntraInInter进行帧内模式预测及编码
                 bool bTryIntra = (m_slice->m_sliceType != B_SLICE || m_param->bIntraInBFrames) && cuGeom.log2CUSize != MAX_LOG2_CU_SIZE && !((m_param->bCTUInfo & 4) && bCtuInfoCheck);
                 if (m_param->rdLevel >= 3)
                 {
@@ -1865,6 +1902,7 @@ SplitData Analysis::compressInterCU_rd0_4(const CUData& parentCTU, const CUGeom&
     return splitCUData;
 }
 
+// rdLevel等于5~6时的帧间预测编码
 SplitData Analysis::compressInterCU_rd5_6(const CUData& parentCTU, const CUGeom& cuGeom, int32_t qp)
 {
     if (parentCTU.m_vbvAffected && !calculateQpforCuSize(parentCTU, cuGeom, 1))
@@ -2766,6 +2804,7 @@ void Analysis::trainCU(const CUData& ctu, const CUGeom& cuGeom, const Mode& best
 
 /* sets md.bestMode if a valid merge candidate is found, else leaves it NULL */
 // 只针对2Nx2N的merge预测技术，在这种模式下，CU、PU、TU均只有一个
+// 注意：checkMerge2Nx2N_rdx_x只是设置当merge候选列表存在时的最佳预测模式（包含merge和skip）
 void Analysis::checkMerge2Nx2N_rd0_4(Mode& skip, Mode& merge, const CUGeom& cuGeom)
 {
     uint32_t depth = cuGeom.depth;
@@ -2907,6 +2946,8 @@ void Analysis::checkMerge2Nx2N_rd0_4(Mode& skip, Mode& merge, const CUGeom& cuGe
 }
 
 /* sets md.bestMode if a valid merge candidate is found, else leaves it NULL */
+// 只针对2Nx2N的merge预测技术，在这种模式下，CU、PU、TU均只有一个
+// 注意：checkMerge2Nx2N_rdx_x只是设置当merge候选列表存在时的最佳预测模式（包含merge和skip）
 void Analysis::checkMerge2Nx2N_rd5_6(Mode& skip, Mode& merge, const CUGeom& cuGeom)
 {
     uint32_t depth = cuGeom.depth;
