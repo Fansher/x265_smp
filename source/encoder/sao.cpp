@@ -31,6 +31,7 @@
 
 namespace {
 
+// 对（num/den）做四舍五入操作，同时保留符号位
 inline int32_t roundIBDI(int32_t num, int32_t den)
 {
     return num >= 0 ? ((num * 2 + den) / (den * 2)) : -((-num * 2 + den) / (den * 2));
@@ -53,6 +54,9 @@ inline int signOf2(const int a, const int b)
     return r;
 }
 
+// count：一个CTB内某个SAO类型样本的个数
+// offset：一个CTB内某个SAO类型样本的补偿值
+// offsetOrg：原始像素与（SAO补偿前）重构像素之间的差值之和
 inline int64_t estSaoDist(int32_t count, int32_t offset, int32_t offsetOrg)
 {
     return (count * offset - offsetOrg * 2) * offset;
@@ -62,6 +66,10 @@ inline int64_t estSaoDist(int32_t count, int32_t offset, int32_t offsetOrg)
 
 namespace X265_NS {
 
+// 边界补偿模式（EO）下像素的5种分类：
+// 第一类谷底和第二类凹点：需要加上一个正补偿值
+// 第四类峰点和第三类凸点：需要加上一个负补偿值
+// 第0类像素：不进行补偿
 const uint32_t SAO::s_eoTable[NUM_EDGETYPE] =
 {
     1, // 0
@@ -271,6 +279,8 @@ void SAO::startSlice(Frame* frame, Entropy& initState)
 }
 
 // CTU-based SAO process without slice granularity
+// 根据SAO补偿模式对重构像素进行补偿
+// addr表示当前CTU序号；typeIdx表示SAO补偿模式；plane表示颜色空间平面序号
 void SAO::applyPixelOffsets(int addr, int typeIdx, int plane)
 {
     PicYuv* reconPic = m_frame->m_reconPic;
@@ -761,6 +771,7 @@ void SAO::calcSaoStatsCTU(int addr, int plane)
         lpelx     >>= m_hChromaShift;
         tpely     >>= m_vChromaShift;
     }
+    // 当前CTU最右侧像素的横坐标、最下方像素的纵坐标；当前CTU的实际宽高
     uint32_t rpelx = x265_min(lpelx + ctuWidth,  picWidth);
     uint32_t bpely = x265_min(tpely + ctuHeight, picHeight);
     ctuWidth  = rpelx - lpelx;
@@ -809,6 +820,7 @@ void SAO::calcSaoStatsCTU(int addr, int plane)
 
     // SAO_BO:
     {
+        // 表示右侧和下方边界不做去方块滤波
         if (m_param->bSaoNonDeblocked)
         {
             skipB = 3;
@@ -818,9 +830,12 @@ void SAO::calcSaoStatsCTU(int addr, int plane)
         endX = (rpelx == picWidth) ? ctuWidth : ctuWidth - skipR + plane_offset;
         endY = (bpely == picHeight) ? ctuHeight : ctuHeight - skipB + plane_offset;
 
+        // 当前CTU按照BO补偿对像素进行归类
+        // 统计数据包括每个条带像素个数、原始像素与重构像素值差值之和
         primitives.saoCuStatsBO(diff, rec0, stride, endX, endY, m_offsetOrg[plane][SAO_BO], m_count[plane][SAO_BO]);
     }
 
+    // SAO_EO_X
     {
         // SAO_EO_0: // dir: -
         {
@@ -1222,6 +1237,7 @@ void SAO::rdoSaoUnitRowEnd(const SAOParam* saoParam, int numctus)
         m_depthSaoRate[1 * SAO_DEPTHRATE_SIZE + m_refDepth] = m_numNoSao[1] / ((double)numctus);
 }
 
+// 计算CTU在各种模式下的最优SAO代价，与直接采用左侧或者上方CTU的SAO参数作比较，找出最优的SAO代价
 void SAO::rdoSaoUnitCu(SAOParam* saoParam, int rowBaseAddr, int idxX, int addr)
 {
     Slice* slice = m_frame->m_encData->m_slice;
@@ -1234,11 +1250,14 @@ void SAO::rdoSaoUnitCu(SAOParam* saoParam, int rowBaseAddr, int idxX, int addr)
         qpCb = x265_clip3(m_param->rc.qpMin, m_param->rc.qpMax, (int)g_chromaScale[x265_clip3(QP_MIN, QP_MAX_MAX, qpCb)]);
     else
         qpCb = x265_clip3(m_param->rc.qpMin, m_param->rc.qpMax, qpCb);
+    // lambda[0]用于亮度SAO参数计算，lambda[1]用于色度SAO参数计算
     lambda[0] = (int64_t)floor(256.0 * x265_lambda2_tab[qp]);
     lambda[1] = (int64_t)floor(256.0 * x265_lambda2_tab[qpCb]); // Use Cb QP for SAO chroma
 
+    // 判断左侧和上方CTU是否存在
     const bool allowMerge[2] = {(idxX != 0), (rowBaseAddr != 0)}; // left, up
 
+    // 判断左侧和上方CTU是否存在（保存对应CTU的addr）
     const int addrMerge[2] = {(idxX ? addr - 1 : -1), (rowBaseAddr ? addr - m_numCuInWidth : -1)};// left, up
 
     bool chroma = m_param->internalCsp != X265_CSP_I400 && m_frame->m_fencPic->m_picCsp != X265_CSP_I400;
@@ -1248,6 +1267,7 @@ void SAO::rdoSaoUnitCu(SAOParam* saoParam, int rowBaseAddr, int idxX, int addr)
     X265_CHECK(sizeof(PerPlane) == (sizeof(int32_t) * (NUM_PLANE * MAX_NUM_SAO_TYPE * MAX_NUM_SAO_CLASS)), "Found Padding space in struct PerPlane");
 
     // TODO: Confirm the address space is continuous
+    // 选择SAO处理方法，开启则处理所有边界像素，关闭则不处理右侧和下方像素。默认值是关闭
     if (m_param->bSaoNonDeblocked)
     {
         memcpy(m_count, m_countPreDblk[addr], sizeof(m_count));
@@ -1375,6 +1395,7 @@ void SAO::rdoSaoUnitCu(SAOParam* saoParam, int rowBaseAddr, int idxX, int addr)
 
 // Rounds the division of initial offsets by the number of samples in
 // each of the statistics table entries.
+// 利用先前已经得到的统计信息（m_count和m_offsetOrg）计算初始补偿值（m_offset）
 void SAO::saoStatsInitialOffset(int addr, int planes)
 {
     Slice* slice = m_frame->m_encData->m_slice;

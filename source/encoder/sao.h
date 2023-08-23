@@ -33,6 +33,8 @@
 namespace X265_NS {
 // private namespace
 
+// sao的三种模式：Edge Offset、Band Offset、不做sao
+// Edge Offset:
 enum SAOType
 {
     SAO_EO_0 = 0,
